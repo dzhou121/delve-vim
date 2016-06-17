@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 import thread
+import threading
+import Queue
+from multiprocessing.pool import ThreadPool
 import os
 import neovim
 import socket
@@ -49,7 +52,27 @@ class DelveAPI(object):
         s.close()
         return reply
 
-    def list_vars(self, goroutineid):
+    def list_args(self, goroutineid, queue):
+        msg = {
+            "method": "RPCServer.ListFunctionArgs",
+            "params": [{
+                "Scope": {
+                    "GoroutineID": goroutineid,
+                },
+                "Cfg": {
+                    "FollowPointers": True,
+                    "MaxVariableRecurse": 5,
+                    "MaxStringLen": 100,
+                    "MaxArrayValues": 100,
+                    "MaxStructFields": 100,
+                },
+            }],
+        }
+        reply = self.send(msg)
+        queue.put(reply)
+        return reply
+
+    def list_vars(self, goroutineid, queue):
         msg = {
             "method": "RPCServer.ListLocalVars",
             "params": [{
@@ -65,7 +88,9 @@ class DelveAPI(object):
                 },
             }],
         }
-        return self.send(msg)
+        reply = self.send(msg)
+        queue.put(reply)
+        return reply
 
     def delete_breakpoint(self, bp_id):
         msg = {
@@ -126,6 +151,7 @@ class Main(object):
         self.indent = ' ' * 2
         self.local_vars = {}
         self.break_points = {}
+        self.current_goroutine = None
         self.delve_buf = None
         self.delve_win = None
         self.delve_file = None
@@ -255,31 +281,40 @@ class Main(object):
         self.display_result(result, var=True)
         self.async_cmd("sign unplace 1 file=%s" % self.delve_file)
 
+    def cursor_goto(self, row, col):
+        self.vim.current.window.cursor = (row, col)
+
     def jump_to(self, local_file, c_line):
         # jump to the local file, this must be executed from non-threaded
-        exists = False
-        for win in self.vim.windows:
-            if local_file.endswith(win.buffer.name):
-                self.vim.current.window = win
-                self.vim.current.window.cursor = (c_line, 1)
-                self.vim.current.window = self.delve_win
-                exists = True
-                break
-
-        if not exists:
-            for win in self.vim.current.tabpage.windows:
-                if not win.buffer.name.endswith(self.delve_buf_name) and \
-                        "NERD_tree" not in win.buffer.name:
-                    exists = True
+        try:
+            exists = False
+            for win in self.vim.windows:
+                if win.buffer.name and \
+                        local_file.endswith(win.buffer.name):
                     self.vim.current.window = win
-                    self.vim.command_output("e %s" % local_file)
                     self.vim.current.window.cursor = (c_line, 1)
+                    self.vim.current.window = self.delve_win
+                    exists = True
                     break
 
             if not exists:
-                self.vim.command_output("vertical split")
-                self.vim.command_output("e %s" % local_file)
-                self.vim.current.window.cursor = (c_line, 1)
+                for win in self.vim.current.tabpage.windows:
+                    if not win.buffer.name.endswith(self.delve_buf_name) and \
+                            "NERD_tree" not in win.buffer.name:
+                        exists = True
+                        self.vim.current.window = win
+                        self.vim.command("e %s" % local_file)
+                        self.vim.current.window.cursor = (c_line, 1)
+                        self.vim.current.window = self.delve_win
+                        break
+
+                if not exists:
+                    self.vim.command("vertical split")
+                    self.vim.command("e %s" % local_file)
+                    self.vim.current.window.cursor = (c_line, 1)
+                    self.vim.current.window = self.delve_win
+        except:
+            self.vim.command("echo 'failed to jump to %s'" % local_file)
 
     def display_result(self, result, var=False):
         local_dir, remote_dir, local_sys, remote_sys = self.delve_dir()
@@ -318,10 +353,30 @@ class Main(object):
                        self.delve_file)
 
         if self.current_goroutine is None:
+            self.vim.async_call(self.delve_buf_append, "unplace sign")
             return
-        r = self.delve.list_vars(self.current_goroutine)
+
+        vars_queue = Queue.Queue()
+        vars_thread = threading.Thread(
+            target=self.delve.list_vars,
+            args=(self.current_goroutine, vars_queue))
+        args_queue = Queue.Queue()
+        args_thread = threading.Thread(
+            target=self.delve.list_args,
+            args=(self.current_goroutine, args_queue))
+        args_thread.start()
+        vars_thread.start()
+
+        r = args_queue.get()
         r = json.loads(r)
-        source_local_vars = r['result']['Variables']
+        source_local_vars = r['result']['Args']
+
+        r = vars_queue.get()
+        r = json.loads(r)
+        source_local_vars = source_local_vars + r['result']['Variables']
+
+        args_thread.join()
+        vars_thread.join()
 
         local_vars = {}
         self.format_parent({}, local_vars, self.local_vars,
@@ -581,6 +636,7 @@ class Main(object):
         self.delve_file = os.path.join(pwd, self.delve_buf_name)
         self.delve_dir()
         self.init_breakpoints()
+        self.halt()
         self.vim.command("setlocal filetype=delve")
         self.vim.command("setlocal buftype=nofile")
         self.vim.command("setlocal bufhidden=hide")
