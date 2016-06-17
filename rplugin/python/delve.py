@@ -1,24 +1,15 @@
 # -*- coding: utf-8 -*-
+import thread
 import os
 import neovim
 import socket
 import json
 
 
-@neovim.plugin
-class Main(object):
-    def __init__(self, vim):
-        self.vim = vim
-        self.prefix = ' '.decode('utf8')
-        self.close_prefix = ' '.decode('utf8')
-        self.indent = ' ' * 2
-        self.local_vars = {}
-        self.break_points = {}
-        # self.s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # self.s.connect(("185.40.140.123", 2345))
-        self.delve_buf = None
-        self.delve_buf_name = '__Delve_Vars__'
-        # self.s.connect(("185.40.140.123", 2345))
+class DelveAPI(object):
+
+    def __init__(self):
+        pass
 
     def recv_timeout(self, timeout=2):
         total_data = []
@@ -35,9 +26,27 @@ class Main(object):
 
         return ''.join(total_data)
 
+    def recv(self, s):
+        total_data = []
+        while 1:
+            data = s.recv(8192)
+            if data == '\n':
+                break
+            elif data:
+                total_data.append(data)
+                if data.endswith('\n'):
+                    break
+            else:
+                break
+
+        return ''.join(total_data)
+
     def send(self, msg):
-        self.s.send(json.dumps(msg))
-        reply = self.recv_timeout()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.connect(("185.40.140.123", 2345))
+        s.send(json.dumps(msg))
+        reply = self.recv(s)
+        s.close()
         return reply
 
     def list_vars(self, goroutineid):
@@ -76,19 +85,20 @@ class Main(object):
                     "line": line,
                     "goroutine": False,
                     "stacktrace": 0,
-                    # "LoadLocals": {
-                    #     "FollowPointers": True,
-                    #     "MaxVariableRecurse": 0,
-                    #     "MaxStringLen": 100,
-                    #     "MaxArrayValues": 100,
-                    #     "MaxStructFields": 100,
-                    # },
                 }
             }]
         }
         return self.send(msg)
 
-    def delv_command(self, cmd):
+    def list_breakpoints(self):
+        msg = {
+            "method": "RPCServer.ListBreakpoints",
+            "params": [{
+            }]
+        }
+        return self.send(msg)
+
+    def command(self, cmd):
         msg = {
             "method": "RPCServer.Command",
             "params": [{
@@ -96,6 +106,34 @@ class Main(object):
             }],
         }
         return self.send(msg)
+
+    def restart(self):
+        msg = {
+            "method": "RPCServer.Restart",
+            "params": [{
+            }],
+        }
+        return self.send(msg)
+
+
+@neovim.plugin
+class Main(object):
+    def __init__(self, vim):
+        self.vim = vim
+        self.delve = DelveAPI()
+        self.prefix = ' '.decode('utf8')
+        self.close_prefix = ' '.decode('utf8')
+        self.indent = ' ' * 2
+        self.local_vars = {}
+        self.break_points = {}
+        self.delve_buf = None
+        self.delve_win = None
+        self.delve_file = None
+        self.delve_local_dir = None
+        self.delve_remote_dir = None
+        self.delve_local_sys = None
+        self.delve_remote_sys = None
+        self.delve_buf_name = '__Delve__'
 
     def get_all_signs(self, output):
         signs = []
@@ -127,11 +165,11 @@ class Main(object):
                         var_type.startswith("<*int")):
                     if len(sub_child['children']) == 0:
                         value = "nil "
-
                 elif (var_type.startswith("<*") and
                         (not (len(sub_child['children']) > 0 and
                         len(sub_child['children'][0]['children']) > 0))):
                     value = "nil "
+
                 buf.append("%s%s: %s%s" % (
                     space * " ",
                     name,
@@ -144,21 +182,52 @@ class Main(object):
                 new_space = space
             self.dump_children(buf, sub_child['children'], new_space)
 
+    @neovim.rpc_export('next', sync=False)
     def next(self):
-        f = os.path.join(os.getcwd(), "__Delve_Vars__")
-        self.vim.command("sign place 1 line=1 name=delve_next file=" + f)
-        r = self.delv_command("next")
+        thread.start_new_thread(self._next, ())
+
+    def _next(self):
+        self.async_cmd("sign place 1 line=1 name=delve_next file=%s" %
+                       self.delve_file)
+        r = self.delve.command("next")
         result = json.loads(r)
         if result.get('error'):
             return
         self.display_result(result)
-        self.vim.command("sign unplace 1 file=%s" % f)
+        self.async_cmd("sign unplace 1 file=%s" % self.delve_file)
 
+    @neovim.rpc_export('halt', sync=False)
     def halt(self):
-        r = self.delv_command("halt")
-        for buf in self.vim.buffers:
-            if buf.name.endswith("__Delve_Vars__"):
-                buf.append(json.dumps(json.loads(r)))
+        thread.start_new_thread(self._halt, ())
+
+    def _halt(self):
+        self.async_cmd("sign place 1 line=1 name=delve_halt file=%s" %
+                       self.delve_file)
+        result = self.delve.command("halt")
+        result = json.loads(result)
+        if not result.get('error'):
+            self.display_result(result)
+
+        self.async_cmd("sign unplace 1 file=%s" % self.delve_file)
+
+    def delve_dir(self):
+        if self.delve_local_dir is None:
+            self.delve_local_dir = self.vim.eval("g:delve_local_dir")
+
+        if self.delve_remote_dir is None:
+            self.delve_remote_dir = self.vim.eval("g:delve_remote_dir")
+
+        if self.delve_local_sys is None:
+            self.delve_local_sys = self.vim.eval("g:delve_local_sys")
+
+        if self.delve_remote_sys is None:
+            self.delve_remote_sys = self.vim.eval("g:delve_remote_sys")
+
+        return (self.delve_local_dir, self.delve_remote_dir,
+                self.delve_local_sys, self.delve_remote_sys)
+
+    def delve_buf_append(self, msg):
+        self.delve_buf.append(msg)
 
     def step(self):
         r = self.delv_command("step")
@@ -169,100 +238,98 @@ class Main(object):
 
         self.display_result(result)
 
+    @neovim.rpc_export('continue_exec', sync=False)
     def continue_exec(self):
-        f = os.path.join(os.getcwd(), "__Delve_Vars__")
-        self.vim.command("sign place 1 line=1 name=delve_start file=" + f)
+        # self._continue_exec()
+        thread.start_new_thread(self._continue_exec, ())
 
-        r = self.delv_command("continue")
-        result = json.loads(r)
-        # for buf in self.vim.buffers:
-        #     if buf.name.endswith("__Delve_Vars__"):
-        #         buf.append(json.dumps(json.loads(r)))
-        #         return
+    def _continue_exec(self):
+        self.async_cmd("sign place 1 line=1 name=delve_start file=%s" %
+                       self.delve_file)
+
+        result = self.delve.command("continue")
+        result = json.loads(result)
         if result.get('error'):
             return
 
         self.display_result(result, var=True)
+        self.async_cmd("sign unplace 1 file=%s" % self.delve_file)
 
-        self.vim.command("sign unplace 1 file=%s" % f)
-
-    def jump_to(self, delve_win, f, c_line):
+    def jump_to(self, local_file, c_line):
+        # jump to the local file, this must be executed from non-threaded
         exists = False
         for win in self.vim.windows:
-            buf_name = os.path.join(os.getcwd(), win.buffer.name)
-            if buf_name == f:
+            if local_file.endswith(win.buffer.name):
                 self.vim.current.window = win
                 self.vim.current.window.cursor = (c_line, 1)
-                self.vim.current.window = delve_win
+                self.vim.current.window = self.delve_win
                 exists = True
                 break
 
         if not exists:
             for win in self.vim.current.tabpage.windows:
-                if not win.buffer.name.endswith("__Delve_Vars__") and \
+                if not win.buffer.name.endswith(self.delve_buf_name) and \
                         "NERD_tree" not in win.buffer.name:
                     exists = True
                     self.vim.current.window = win
-                    self.vim.command_output("e %s" % f)
+                    self.vim.command_output("e %s" % local_file)
                     self.vim.current.window.cursor = (c_line, 1)
+                    break
 
             if not exists:
                 self.vim.command_output("vertical split")
-                self.vim.command_output("e %s" % f)
+                self.vim.command_output("e %s" % local_file)
                 self.vim.current.window.cursor = (c_line, 1)
 
     def display_result(self, result, var=False):
+        local_dir, remote_dir, local_sys, remote_sys = self.delve_dir()
         bp_info = result['result']['State']
-        current_thread = bp_info['currentThread']
+        current_thread = bp_info.get('currentThread')
+        if current_thread is None:
+            return
+
         self.current_goroutine = current_thread["goroutineID"]
         c_line = int(current_thread['line'])
-        c_file = current_thread['file']
+        remote_file = current_thread['file']
 
-        for buf in self.vim.buffers:
-            if buf.name.endswith("__Delve_Vars__"):
-                break
+        if remote_file.startswith(remote_dir):
+            local_file = remote_file.replace(remote_dir, local_dir)
+        elif remote_file.startswith(remote_sys):
+            local_file = remote_file.replace(remote_sys, local_sys)
+        else:
+            self.async_echo("cannot jump to remote file %s" % remote_file)
+            return
 
-        local_dir = self.vim.eval("g:delve_local_dir")
-        remote_dir = self.vim.eval("g:delve_remote_dir")
-        f = c_file.replace(remote_dir, local_dir)
-        for win in self.vim.windows:
-            if win.buffer.name.endswith("__Delve_Vars__"):
-                delve_win = win
+        if not os.path.exists(local_file):
+            self.async_echo("cannot jump to file %s" % local_file)
+            return
 
-        self.jump_to(delve_win, f, c_line)
+        self.vim.async_call(self.jump_to, local_file, c_line)
 
         if var:
-            self.display_vars()
+            self._display_vars()
 
-        # r = self.list_vars(self.current_goroutine)
-        # r = json.loads(r)
-        # source_local_vars = r['result']['Variables']
-
-        # for buf in self.vim.buffers:
-        #     if buf.name.endswith("__Delve_Vars__"):
-        #         local_vars = {}
-        #         self.format_parent({}, local_vars, self.local_vars,
-        #                            source_local_vars)
-        #         self.local_vars = local_vars
-        #         self.set_local_vars(buf)
-
+    @neovim.rpc_export('display_vars', sync=False)
     def display_vars(self):
-        f = os.path.join(os.getcwd(), "__Delve_Vars__")
-        self.vim.command("sign place 1 line=1 name=delve_vars file=" + f)
+        thread.start_new_thread(self._display_vars, ())
 
-        r = self.list_vars(self.current_goroutine)
+    def _display_vars(self):
+        self.async_cmd("sign place 1 line=1 name=delve_vars file=%s" %
+                       self.delve_file)
+
+        if self.current_goroutine is None:
+            return
+        r = self.delve.list_vars(self.current_goroutine)
         r = json.loads(r)
         source_local_vars = r['result']['Variables']
 
-        for buf in self.vim.buffers:
-            if buf.name.endswith("__Delve_Vars__"):
-                local_vars = {}
-                self.format_parent({}, local_vars, self.local_vars,
-                                   source_local_vars)
-                self.local_vars = local_vars
-                self.set_local_vars(buf)
+        local_vars = {}
+        self.format_parent({}, local_vars, self.local_vars,
+                           source_local_vars)
+        self.local_vars = local_vars
+        self.set_local_vars()
 
-        self.vim.command("sign unplace 1 file=%s" % f)
+        self.async_cmd("sign unplace 1 file=%s" % self.delve_file)
 
     def format_var_line(self, var):
         name = var['name']
@@ -294,7 +361,16 @@ class Main(object):
                 prefix = self.prefix
         return("%s%s: %s%s" % (prefix, name, value, var_type))
 
-    def set_local_vars(self, buf, expand_all=None):
+    def buf_set_lines(self, lines):
+        self.delve_buf[:] = lines
+
+    def set_local_vars(self, expand_all=None):
+        self.vim.async_call(self.delve_buf_append, "set local vars start")
+        lines = self.local_vars_lines(expand_all=expand_all)
+        self.vim.async_call(self.delve_buf_append, "set local vars got lines")
+        self.vim.async_call(self.buf_set_lines, lines)
+
+    def local_vars_lines(self, expand_all=None):
         local_vars = [var for name, var in self.local_vars.items()]
         local_vars.sort(key=lambda d: len(d['children']) == 0)
         lines = []
@@ -305,8 +381,7 @@ class Main(object):
             lines.append((self.indent * indent_num +
                           self.format_var_line(var)).encode('utf8'))
             self._openfold_lines(lines, indent_num, var, expand_all=expand_all)
-
-        buf[:] = lines
+        return lines
 
     def format_parent(self, parent, children, original_children,
                       source_children):
@@ -355,19 +430,19 @@ class Main(object):
                                        original_children,
                                        child['children'])
 
+    @neovim.rpc_export('restart', sync=False)
     def restart(self):
-        msg = {
-            "method": "RPCServer.Restart",
-            "params": [{
-            }],
-        }
-        for buf in self.vim.buffers:
-            if buf.name.endswith("__Delve_Vars__"):
-                buf.append("start sending")
-        reply = self.send(msg)
-        for buf in self.vim.buffers:
-            if buf.name.endswith("__Delve_Vars__"):
-                buf.append(json.dumps(json.loads(reply)))
+        thread.start_new_thread(self._restart, ())
+
+    def _restart(self):
+        self.async_cmd("sign place 1 line=1 name=delve_restart file=%s" %
+                       self.delve_file)
+        self.vim.async_call(self.delve_buf_append,
+                            "start sending restart")
+        reply = self.delve.restart()
+        self.vim.async_call(self.delve_buf_append,
+                            json.dumps(json.loads(reply)))
+        self.async_cmd("sign unplace 1 file=%s" % self.delve_file)
 
     def get_key(self, line, indent_num):
         parts = line.split(self.indent)
@@ -388,20 +463,23 @@ class Main(object):
                 self.find_parent_key(keys, buf, indent_num - 1, n)
                 return
 
+    @neovim.rpc_export('open_all_fold', sync=False)
     def open_all_fold(self):
         for buf in self.vim.buffers:
-            if buf.name.endswith("__Delve_Vars__"):
-                self.set_local_vars(buf, expand_all=True)
+            if buf.name.endswith(self.delve_buf_name):
+                self.set_local_vars(expand_all=True)
 
+    @neovim.rpc_export('close_all_fold', sync=False)
     def close_all_fold(self):
         for buf in self.vim.buffers:
-            if buf.name.endswith("__Delve_Vars__"):
-                self.set_local_vars(buf, expand_all=False)
+            if buf.name.endswith(self.delve_buf_name):
+                self.set_local_vars(expand_all=False)
 
+    @neovim.rpc_export('openfold', sync=False)
     def openfold(self):
         exits = False
         for win in self.vim.windows:
-            if win.buffer.name.endswith("__Delve_Vars__"):
+            if win.buffer.name.endswith(self.delve_buf_name):
                 buf = win.buffer
                 n = win.cursor[0] - 1
                 exits = True
@@ -484,21 +562,12 @@ class Main(object):
         self._openfold_lines(lines, indent_num, parent)
         buf.append(lines, n + 1)
 
-        # m = n
-        # indent_num += 1
-        # for child in children:
-        #     m += 1
-        #     buf.append(self.indent * indent_num +
-        #                self.format_var_line(child),
-        #                m)
-        #     if child.get('expanded', False):
-        #         m += self._openfold(buf, indent_num, m)
-        # return m - n
-
     def find_delve_win(self):
         for w in self.vim.current.tabpage.windows:
             if self.delve_buf_name in w.buffer.name:
+                self.delve_win = w
                 return w
+        self.delve_win = None
 
     def find_delve_buf(self):
         for buf in self.vim.buffers:
@@ -508,15 +577,18 @@ class Main(object):
 
     def init_delve_buf(self):
         self.find_delve_buf()
-
-        self.vim.command_output("setlocal filetype=delve")
-        self.vim.command_output("setlocal buftype=nofile")
-        self.vim.command_output("setlocal bufhidden=hide")
-        self.vim.command_output("setlocal noswapfile")
-        self.vim.command_output("setlocal nobuflisted")
-        self.vim.command_output("setlocal nomodifiable")
-        self.vim.command_output("setlocal nolist")
-        self.vim.command_output("setlocal nowrap")
+        pwd = self.vim.command_output("silent pwd")[1:]
+        self.delve_file = os.path.join(pwd, self.delve_buf_name)
+        self.delve_dir()
+        self.init_breakpoints()
+        self.vim.command("setlocal filetype=delve")
+        self.vim.command("setlocal buftype=nofile")
+        self.vim.command("setlocal bufhidden=hide")
+        self.vim.command("setlocal noswapfile")
+        self.vim.command("setlocal nobuflisted")
+        self.vim.command("setlocal nomodifiable")
+        self.vim.command("setlocal nolist")
+        self.vim.command("setlocal nowrap")
 
         self.vim.command("nmap cgc c")
         self.vim.command("nunmap cgc")
@@ -527,7 +599,7 @@ class Main(object):
             ['s',             'delve#start()'],
             ['c',             'delve#continue()'],
             ['r',             'delve#restart()'],
-            ['a',             'delve#halt()'],
+            ['p',             'delve#halt()'],
             ['m',             'delve#next()'],
             ['o',             'delve#openfold()'],
             ['O',             'delve#open_all_fold()'],
@@ -540,36 +612,35 @@ class Main(object):
                 keymap[0], keymap[1]
             )
 
-            self.vim.command_output(cmd)
+            self.vim.command(cmd)
 
-#         self.vim.command_output("keepalt split __Delve_log__")
-#         self.vim.command_output("setlocal filetype=delve")
-#         self.vim.command_output("setlocal buftype=nofile")
-#         self.vim.command_output("setlocal bufhidden=hide")
-#         self.vim.command_output("setlocal noswapfile")
-#         self.vim.command_output("setlocal nobuflisted")
-#         self.vim.command_output("setlocal nomodifiable")
-#         self.vim.command_output("setlocal nolist")
-#         self.vim.command_output("setlocal nowrap")
-
+    @neovim.rpc_export('open_window', sync=False)
     def open_window(self):
-        delve_win = self.find_delve_win()
-        if delve_win:
-            old_win = self.vim.current.window
-            old_is_self = self.delve_buf_name in old_win.buffer.name
-            self.vim.current.window = delve_win
-            self.vim.command("close")
-            if not old_is_self:
-                self.vim.current.window = old_win
-            return
+        self._open_window()
+
+    def _open_window(self):
+        self.find_delve_win()
+        if self.delve_win:
+            if self.vim.current.tabpage == self.delve_win.tabpage:
+                old_win = self.vim.current.window
+                old_is_self = self.delve_buf_name in old_win.buffer.name
+                self.vim.current.window = self.delve_win
+                self.delve_win = None
+                self.vim.command("close")
+                if not old_is_self:
+                    self.vim.current.window = old_win
+                return
+            else:
+                self.vim.current.window = self.delve_win
+                return
 
         # check if the buf exists or not
         delve_buf_exits = self.delve_buf is not None
 
         # at this step, it means the win is not open, so open it first
-        self.vim.command_output(
+        self.vim.command(
             "keepalt vertical botright split %s" % self.delve_buf_name)
-        delve_win = self.find_delve_win()
+        self.find_delve_win()
 
         if not delve_buf_exits:
             self.init_delve_buf()
@@ -581,46 +652,30 @@ class Main(object):
 
             self.vim.command("setlocal modifiable")
             self.delve_buf[:] = lines
-            self.vim.command("setlocal nomodifiable")
-        # indent = (delve_win.width - len(line)) / 2
-        # if indent < 0:
-        #     indent = 0
-        # if len(self.delve_buf) == 0:
-        #     self.delve_buf[:] = [line]
-        # else:
-        # self.delve_buf[0] = ' ' * indent + line + ' ' * indent
 
-        # for buf in self.vim.buffers:
-        #     if buf.name.endswith("__Delve_Vars__"):
-        #         """
-# 
-#         
-# 
-# 
-# 
-        #         """
-                # f = os.path.join(os.getcwd(), "__Delve_Vars__")
-                # self.vim.command("sign place 1 line=1 name=delve_start file=" + f)
-                # self.vim.command("sign place 2 line=2 name=delve_stop file=" + f)
-
-    @neovim.function("_delve")
+    @neovim.function("_delve", sync=True)
     def testcommand(self, args):
-        try:
-            self.run(args)
-        except Exception as e:
-            for buf in self.vim.buffers:
-                if buf.name.endswith("__Delve_Vars__"):
-                    buf.append(str(e))
+        self.vim.vars['delve#channel_id'] = self.vim.channel_id
 
-    def run(self, args):
-        if len(args) > 0:
-            c = getattr(self, args[0])
-            c()
+    def init_breakpoints(self):
+        thread.start_new_thread(self._init_breakpoints, ())
+
+    def _init_breakpoints(self):
+        result = self.delve.list_breakpoints()
+        result = json.loads(result)
+        if result.get('error'):
             return
-            if args[0] == 'open_window':
-                self.open_window()
-                return
 
+        breakpoints = result['result'].get('Breakpoints', [])
+        for bp in breakpoints:
+            path = bp['file'].replace(self.delve_remote_dir,
+                                      self.delve_local_dir)
+            row = bp["line"]
+            bp_key = "%s:%s" % (path, row)
+            self.break_points[bp_key] = bp['id']
+
+    @neovim.rpc_export('new_breakpoint', sync=False)
+    def new_breakpoint(self):
         path = self.vim.command_output("silent echo expand('%:p')")[1:]
         row = self.vim.current.window.cursor[0]
 
@@ -636,41 +691,56 @@ class Main(object):
 
         signs = self.vim.command_output("silent sign place file=%s" % path)
         bp_key = "%s:%s" % (path, row)
-        if str(row) in signs:
-            bp_id = self.break_points.get(bp_key)
-            if bp_id:
-                reply = self.delete_breakpoint(bp_id)
-                reply = json.loads(reply)
-                error = reply.get('error', '')
-                if error:
-                    self.vim.command('echo "%s"' % error)
 
-                self.vim.command("sign unplace %s file=%s" % (row, path))
+        if str(row) in signs:
+            # self._delete_breakpoint(bp_key, row, path)
+            thread.start_new_thread(self._delete_breakpoint,
+                                    (bp_key, row, path))
         else:
-            cmd = "sign place %s line=%s name=delve_breakpoint file=%s" % (
-                row, row, path
-            )
-            self.vim.command(cmd)
-            reply = self.create_breakpoint(remote_path, row)
+            # self._create_breakpoint(bp_key, row, path, remote_path)
+            thread.start_new_thread(self._create_breakpoint,
+                                    (bp_key, row, path, remote_path))
+
+    def async_echo(self, text):
+        self.async_cmd("echo '%s'" % text)
+
+    def async_cmd(self, cmd):
+        # use vim async call to call vim command, for use from thread
+        self.vim.async_call(self.vim.command, cmd)
+
+    def _delete_breakpoint(self, bp_key, row, path):
+        bp_id = self.break_points.get(bp_key)
+        if bp_id:
+            reply = self.delve.delete_breakpoint(bp_id)
             reply = json.loads(reply)
             error = reply.get('error', '')
-            if not error:
-                bp_id = reply['result']['Breakpoint']['id']
-                self.break_points[bp_key] = bp_id
-            if not error or error.startswith("Breakpoint exists"):
-                cmd = ("sign place %s line=%s "
-                       "name=delve_breakpoint_confirmed file=%s" % (
-                           row, row, path
-                       ))
-                self.vim.command(cmd)
-            else:
-                self.vim.command("sign unplace %s file=%s" % (row, path))
-                self.vim.command('echo "%s"' % error)
+            if error:
+                self.async_cmd('echo "%s"' % error)
 
+            self.async_cmd("sign unplace %s file=%s" % (row, path))
+
+    def _create_breakpoint(self, bp_key, row, path, remote_path):
+        cmd = "sign place %s line=%s name=delve_breakpoint file=%s" % (
+            row, row, path
+        )
+        self.async_cmd(cmd)
+        reply = self.delve.create_breakpoint(remote_path, row)
+        reply = json.loads(reply)
+        error = reply.get('error', '')
+        if not error:
+            bp_id = reply['result']['Breakpoint']['id']
+            self.break_points[bp_key] = bp_id
+        if not error or error.startswith("Breakpoint exists"):
+            cmd = ("sign place %s line=%s "
+                   "name=delve_breakpoint_confirmed file=%s" % (
+                       row, row, path
+                   ))
+            self.async_cmd(cmd)
+        else:
+            self.async_cmd("sign unplace %s file=%s" % (row, path))
+            self.async_cmd('echo "%s"' % error)
 
 if __name__ == "__main__":
     vim = neovim.attach("socket", path='/tmp/nvim')
     m = Main(vim)
     m.continue_exec()
-    # for buffer in vim.buffers:
-    #     print buffer.name
