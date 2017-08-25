@@ -65,7 +65,7 @@ nmap <silent> <C-c> :call delve#new_breakpoint()<cr>
 nmap <leader>b :call delve#openwindow()<cr>
 
 sign define delve_breakpoint text=➤ texthl=identifier
-sign define delve_breakpoint_confirmed text=➤ texthl=statement
+sign define delve_breakpoint_confirmed text=➤ texthl=String
 sign define delve_start text=
 sign define delve_halt text=
 sign define delve_stop text=

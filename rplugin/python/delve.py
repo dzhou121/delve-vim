@@ -46,11 +46,15 @@ class DelveAPI(object):
 
     def send(self, msg):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.connect(("185.40.140.123", 2345))
-        s.send(json.dumps(msg))
-        reply = self.recv(s)
-        s.close()
-        return reply
+        try:
+            s.connect(("10.132.0.2", 2345))
+            s.send(json.dumps(msg))
+            reply = self.recv(s)
+            s.close()
+            reply = json.loads(reply)
+            return reply
+        except Exception as e:
+            return {'error': str(e)}
 
     def list_args(self, goroutineid, queue):
         msg = {
@@ -61,7 +65,7 @@ class DelveAPI(object):
                 },
                 "Cfg": {
                     "FollowPointers": True,
-                    "MaxVariableRecurse": 5,
+                    "MaxVariableRecurse": 1,
                     "MaxStringLen": 100,
                     "MaxArrayValues": 100,
                     "MaxStructFields": 100,
@@ -81,7 +85,7 @@ class DelveAPI(object):
                 },
                 "Cfg": {
                     "FollowPointers": True,
-                    "MaxVariableRecurse": 5,
+                    "MaxVariableRecurse": 1,
                     "MaxStringLen": 100,
                     "MaxArrayValues": 100,
                     "MaxStructFields": 100,
@@ -123,6 +127,13 @@ class DelveAPI(object):
         }
         return self.send(msg)
 
+    def state(self):
+        msg = {
+            "method": "RPCServer.State",
+            "params": [{}],
+        }
+        return self.send(msg)
+
     def command(self, cmd):
         msg = {
             "method": "RPCServer.Command",
@@ -160,6 +171,7 @@ class Main(object):
         self.delve_local_sys = None
         self.delve_remote_sys = None
         self.delve_buf_name = '__Delve__'
+        self.running = False
 
     def get_all_signs(self, output):
         signs = []
@@ -193,7 +205,7 @@ class Main(object):
                         value = "nil "
                 elif (var_type.startswith("<*") and
                         (not (len(sub_child['children']) > 0 and
-                        len(sub_child['children'][0]['children']) > 0))):
+                              len(sub_child['children'][0]['children']) > 0))):
                     value = "nil "
 
                 buf.append("%s%s: %s%s" % (
@@ -215,8 +227,7 @@ class Main(object):
     def _next(self):
         self.async_cmd("sign place 1 line=1 name=delve_next file=%s" %
                        self.delve_file)
-        r = self.delve.command("next")
-        result = json.loads(r)
+        result = self.delve.command("next")
         if result.get('error'):
             return
         self.display_result(result)
@@ -227,14 +238,17 @@ class Main(object):
         thread.start_new_thread(self._halt, ())
 
     def _halt(self):
-        self.async_cmd("sign place 1 line=1 name=delve_halt file=%s" %
-                       self.delve_file)
+        # self.async_cmd("sign place 1 line=1 name=delve_halt file=%s" %
+        #                self.delve_file)
+        self.running = False
         result = self.delve.command("halt")
-        result = json.loads(result)
-        if not result.get('error'):
-            self.display_result(result)
+        if result.get('error'):
+            self.async_echo(result.get('error'))
+            return
 
-        self.async_cmd("sign unplace 1 file=%s" % self.delve_file)
+        # self.display_result(result)
+        # self.async_cmd("sign unplace 1 file=%s" % self.delve_file)
+        self.vim.async_call(self.delve_buf_icon, '             ')
 
     def delve_dir(self):
         if self.delve_local_dir is None:
@@ -255,10 +269,14 @@ class Main(object):
     def delve_buf_append(self, msg):
         self.delve_buf.append(msg)
 
-    def step(self):
-        r = self.delv_command("step")
+    def delve_buf_icon(self, msg):
+        self.delve_buf[0] = msg
 
-        result = json.loads(r)
+    def delve_loading_var(self):
+        self.delve_buf[2] = '          '
+
+    def step(self):
+        result = self.delv_command("step")
         if result.get('error'):
             return
 
@@ -270,16 +288,22 @@ class Main(object):
         thread.start_new_thread(self._continue_exec, ())
 
     def _continue_exec(self):
-        self.async_cmd("sign place 1 line=1 name=delve_start file=%s" %
-                       self.delve_file)
-
-        result = self.delve.command("continue")
-        result = json.loads(result)
-        if result.get('error'):
+        # self.async_cmd("sign place 1 line=1 name=delve_start file=%s" %
+        #                self.delve_file)
+        if self.running:
             return
 
-        self.display_result(result, var=True)
-        self.async_cmd("sign unplace 1 file=%s" % self.delve_file)
+        self.running = True
+        self.vim.async_call(self.delve_buf_icon, '             ')
+        result = self.delve.command("continue")
+        self.running = False
+        self.vim.async_call(self.delve_buf_icon, '             ')
+        if result.get('error'):
+            self.async_echo(result.get('error'))
+            return
+
+        self.display_result(result, var=False)
+        # self.async_cmd("sign unplace 1 file=%s" % self.delve_file)
 
     def cursor_goto(self, row, col):
         self.vim.current.window.cursor = (row, col)
@@ -349,13 +373,13 @@ class Main(object):
         thread.start_new_thread(self._display_vars, ())
 
     def _display_vars(self):
-        self.async_cmd("sign place 1 line=1 name=delve_vars file=%s" %
-                       self.delve_file)
-
-        if self.current_goroutine is None:
-            self.vim.async_call(self.delve_buf_append, "unplace sign")
+        if self.running:
             return
 
+        if self.current_goroutine is None:
+            return
+
+        self.vim.async_call(self.delve_loading_var)
         vars_queue = Queue.Queue()
         vars_thread = threading.Thread(
             target=self.delve.list_vars,
@@ -368,11 +392,9 @@ class Main(object):
         vars_thread.start()
 
         r = args_queue.get()
-        r = json.loads(r)
         source_local_vars = r['result']['Args']
 
         r = vars_queue.get()
-        r = json.loads(r)
         source_local_vars = source_local_vars + r['result']['Variables']
 
         args_thread.join()
@@ -383,8 +405,6 @@ class Main(object):
                            source_local_vars)
         self.local_vars = local_vars
         self.set_local_vars()
-
-        self.async_cmd("sign unplace 1 file=%s" % self.delve_file)
 
     def format_var_line(self, var):
         name = var['name']
@@ -417,7 +437,7 @@ class Main(object):
         return("%s%s: %s%s" % (prefix, name, value, var_type))
 
     def buf_set_lines(self, lines):
-        self.delve_buf[:] = lines
+        self.delve_buf[2:] = lines
 
     def set_local_vars(self, expand_all=None):
         self.vim.async_call(self.delve_buf_append, "set local vars start")
@@ -496,7 +516,7 @@ class Main(object):
                             "start sending restart")
         reply = self.delve.restart()
         self.vim.async_call(self.delve_buf_append,
-                            json.dumps(json.loads(reply)))
+                            json.dumps(reply))
         self.async_cmd("sign unplace 1 file=%s" % self.delve_file)
 
     def get_key(self, line, indent_num):
@@ -701,9 +721,9 @@ class Main(object):
         if not delve_buf_exits:
             self.init_delve_buf()
             lines = [
-                '                 ',
-                '                      ',
-                '> Variables           ',
+                '             ',
+                '                 ',
+                '                 ',
             ]
 
             self.vim.command("setlocal modifiable")
@@ -718,7 +738,6 @@ class Main(object):
 
     def _init_breakpoints(self):
         result = self.delve.list_breakpoints()
-        result = json.loads(result)
         if result.get('error'):
             return
 
@@ -760,6 +779,9 @@ class Main(object):
     def async_echo(self, text):
         self.async_cmd("echo '%s'" % text)
 
+    def async_echoerr(self, text):
+        self.async_cmd("echoerr '%s'" % text)
+
     def async_cmd(self, cmd):
         # use vim async call to call vim command, for use from thread
         self.vim.async_call(self.vim.command, cmd)
@@ -768,7 +790,6 @@ class Main(object):
         bp_id = self.break_points.get(bp_key)
         if bp_id:
             reply = self.delve.delete_breakpoint(bp_id)
-            reply = json.loads(reply)
             error = reply.get('error', '')
             if error:
                 self.async_cmd('echo "%s"' % error)
@@ -781,7 +802,6 @@ class Main(object):
         )
         self.async_cmd(cmd)
         reply = self.delve.create_breakpoint(remote_path, row)
-        reply = json.loads(reply)
         error = reply.get('error', '')
         if not error:
             bp_id = reply['result']['Breakpoint']['id']
@@ -797,6 +817,5 @@ class Main(object):
             self.async_cmd('echo "%s"' % error)
 
 if __name__ == "__main__":
-    vim = neovim.attach("socket", path='/tmp/nvim')
-    m = Main(vim)
-    m.continue_exec()
+    d = DelveAPI()
+    print d.list_vars(1, None)

@@ -13,8 +13,8 @@ hi link DelveType Type
 hi link DelveString String
 hi link DelveValue Identifier
 hi link DelveNil Error
-hi link DelveStart Statement
-hi link DelveHalt Comment
-hi link DelveStop Comment
+hi link DelveStart String
+hi link DelveHalt String
+hi link DelveStop ErrorMsg
 hi link DelveNext Comment
 hi link DelveRestart Comment
