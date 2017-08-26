@@ -14,6 +14,20 @@ class DelveAPI(object):
     def __init__(self):
         pass
 
+    def get_vars_params(self, goroutineid):
+        return [{
+            "Scope": {
+                "GoroutineID": goroutineid,
+            },
+            "Cfg": {
+                "FollowPointers": True,
+                "MaxVariableRecurse": 2,
+                "MaxStringLen": 100,
+                "MaxArrayValues": 100,
+                "MaxStructFields": 100,
+            },
+        }]
+
     def recv_timeout(self, timeout=2):
         total_data = []
         while 1:
@@ -59,38 +73,25 @@ class DelveAPI(object):
     def list_args(self, goroutineid, queue):
         msg = {
             "method": "RPCServer.ListFunctionArgs",
-            "params": [{
-                "Scope": {
-                    "GoroutineID": goroutineid,
-                },
-                "Cfg": {
-                    "FollowPointers": True,
-                    "MaxVariableRecurse": 1,
-                    "MaxStringLen": 100,
-                    "MaxArrayValues": 100,
-                    "MaxStructFields": 100,
-                },
-            }],
+            "params": self.get_vars_params(goroutineid),
         }
         reply = self.send(msg)
         queue.put(reply)
         return reply
 
+    def get_var(self, goroutineid, var):
+        params = self.get_vars_params(goroutineid)
+        params[0]["Expr"] = var
+        msg = {
+            "method": "RPCServer.Eval",
+            "params": params,
+        }
+        return self.send(msg)
+
     def list_vars(self, goroutineid, queue):
         msg = {
             "method": "RPCServer.ListLocalVars",
-            "params": [{
-                "Scope": {
-                    "GoroutineID": goroutineid,
-                },
-                "Cfg": {
-                    "FollowPointers": True,
-                    "MaxVariableRecurse": 1,
-                    "MaxStringLen": 100,
-                    "MaxArrayValues": 100,
-                    "MaxStructFields": 100,
-                },
-            }],
+            "params": self.get_vars_params(goroutineid),
         }
         reply = self.send(msg)
         queue.put(reply)
@@ -406,14 +407,29 @@ class Main(object):
         self.local_vars = local_vars
         self.set_local_vars()
 
+    def short_var(self, var):
+        i = len(var) - 1
+        while i >= 0:
+            if var[i] == '*' or var[i] == ']' or var[i] == '<'\
+                    or var[i] == ' ':
+                break
+            i -= 1
+        prefix = var[0:i+1]
+        var = '%s%s' % (prefix,
+                        var[i+1:].split('/')[-1])
+        return var
+
     def format_var_line(self, var):
         name = var['name']
         # if ' ' in name:
         #     name = name.split(' ')[-1]
         value = var['value']
         var_type = var['type']
+        var_realtype = var.get('realtype', '')
+        if var_realtype:
+            var_realtype = '.(%s)' % self.short_var(var_realtype)
 
-        var_type = '<%s>' % var_type
+        var_type = '<%s%s>' % (self.short_var(var_type), var_realtype)
         if value:
             if var_type == "<string>":
                 value = value.replace("\n", "\\n")
@@ -437,12 +453,19 @@ class Main(object):
         return("%s%s: %s%s" % (prefix, name, value, var_type))
 
     def buf_set_lines(self, lines):
+        cursor = self.vim.current.window.cursor
         self.delve_buf[2:] = lines
+        self.vim.current.window.cursor = cursor
+
+    def get_current_cursor(self):
+        self.cursor = self.vim.current.window.cursor
+
+    def set_current_cursor(self):
+        if self.cursor:
+            self.vim.current.window.cursor = self.cursor
 
     def set_local_vars(self, expand_all=None):
-        self.vim.async_call(self.delve_buf_append, "set local vars start")
         lines = self.local_vars_lines(expand_all=expand_all)
-        self.vim.async_call(self.delve_buf_append, "set local vars got lines")
         self.vim.async_call(self.buf_set_lines, lines)
 
     def local_vars_lines(self, expand_all=None):
@@ -460,24 +483,65 @@ class Main(object):
 
     def format_parent(self, parent, children, original_children,
                       source_children):
+        previous_value = ""
         for i, child in enumerate(source_children):
             name = child['name']
             if parent.get('type', '').startswith('map['):
                 if i % 2 == 0:
-                    name = str(i / 2) + ' key'
+                    name = '[%s] key' % str(i / 2)
                 else:
-                    name = str(i / 2) + ' value'
+                    name = '[%s] value' % str(i / 2)
             elif parent.get('type', '').startswith('[]'):
-                name = str(i)
+                name = '[' + str(i) + ']'
 
             value = child['value']
             var_type = child['type']
-            if name:
+            # prefix = ''
+            # if var_type.startswith('*'):
+            #     prefix = '*'
+            # if var_type.startswith('chan '):
+            #     prefix = 'chan '
+            # if var_type.startswith('chan *'):
+            #     prefix = 'chan *'
+            # var_type = '%s%s' % (prefix,
+            #                      child['type'].split('/')[-1])
+            if parent.get('interface') and child['name'] == 'data':
+                self.format_parent(parent,
+                                   children,
+                                   original_children,
+                                   child['children'])
+                parent['realtype'] = var_type
+            elif name:
                 children[name] = {}
+                parent_var = parent.get('var', '')
+                if parent_var:
+                    parent_var += "."
+                    if parent.get('realtype'):
+                        realtype = parent['realtype']
+                        parent_var = '%s(%s).' % (parent_var,
+                                                  self.short_var(realtype))
+                child_var = child['name'].split('.')[-1]
+                children[name]['var'] = (
+                    "%s%s" % (parent_var, child_var))
+                if parent.get('type', '').startswith('map['):
+                    if i % 2 != 0:
+                        children[name]['var'] = (
+                            '%s["%s"]' % (parent.get('var', ''),
+                                          previous_value)
+                        )
+                elif parent.get('type', '').startswith('[]'):
+                    children[name]['var'] = (
+                        '%s[%s]' % (parent.get('var', ''),
+                                    i)
+                    )
+
+                # self.async_echo(name)
+                previous_value = child['value']
                 children[name]['name'] = name
                 children[name]['value'] = value
                 children[name]['type'] = var_type
                 children[name]['children'] = {}
+                children[name]['interface'] = child.get('kind') == 20
                 children[name]['expanded'] = original_children.get(
                     name, {}).get('expanded', False)
                 self.format_parent(
@@ -493,6 +557,7 @@ class Main(object):
                     children[name]['value'] = value
                     children[name]['type'] = var_type
                     children[name]['children'] = {}
+                    children[name]['interface'] = child.get('kind') == 20
                     self.format_parent(
                         children[name],
                         children[name]['children'],
@@ -627,9 +692,30 @@ class Main(object):
                 self._openfold_lines(lines, indent_num, child,
                                      expand_all=expand_all)
 
+    def get_var(self, parent):
+        parent['downloaded'] = True
+        result = self.delve.get_var(self.current_goroutine, parent['var'])
+        if result.get('error'):
+            return
+
+        source_vars = result['result']['Variable']
+        local_vars = {}
+        try:
+            self.format_parent(parent, local_vars,
+                               parent.get('children', {}),
+                               source_vars["children"])
+        except Exception as e:
+            self.vim.async_call(self.delve_buf_append, str(e))
+            return
+        parent['children'] = local_vars
+        self.set_local_vars()
+
     def _openfold(self, buf, indent_num, n):
         parent = self.find_parent(buf, indent_num, n)
         parent['expanded'] = True
+        if not parent.get('downloaded', False):
+            if self.current_goroutine is not None:
+                thread.start_new_thread(self.get_var, (parent,))
         buf[n] = buf[n].decode('utf8').replace(
             self.prefix, self.close_prefix).encode('utf8')
 
@@ -818,4 +904,4 @@ class Main(object):
 
 if __name__ == "__main__":
     d = DelveAPI()
-    print d.list_vars(1, None)
+    print d.print_var(7, "request")
